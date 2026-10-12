@@ -1,0 +1,17 @@
+.env
+text.txt
+*.env
+__pycache__/
+*.pyc
+chroma_db/
+ai_creations/
+workspace.json
+video_frames/
+downloaded_*
+*.mp3
+*.mp4
+skills_db/
+skills.json
+.pytest_cache/
+venv/
+.venv/
