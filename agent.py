@@ -2,10 +2,10 @@
 agent.py — The Brain.
 
 Multi-model agent with tool calling, memory, streaming, and a persistent
-skill library. Exposes:
-    - run_turn(user_input, messages) -> generator of events
-    - sessions: in-memory dict for web sessions
-    - main(): CLI loop
+skill library.
+
+Manual fallback chain: if a model errors BEFORE yielding any token,
+the next model is tried.
 """
 
 import os
@@ -21,19 +21,18 @@ from langchain_core.messages import (
 from langchain_core.tools import tool
 
 from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
+
+try:
+    from langchain_groq import ChatGroq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
 
 try:
     from langchain_cerebras import ChatCerebras
     HAS_CEREBRAS = True
 except ImportError:
     HAS_CEREBRAS = False
-
-try:
-    from langchain_cohere import ChatCohere
-    HAS_COHERE = True
-except ImportError:
-    HAS_COHERE = False
 
 from tools import (
     youtube_to_text, web_search, generate_image, text_to_speech,
@@ -52,14 +51,61 @@ from prompts import build_system_prompt
 load_dotenv()
 
 
+# ═══════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════
+
 def log(msg: str) -> None:
     if config.VERBOSE:
         print(msg)
 
 
+def truncate_tool_result(result: str, max_chars: int = 4000) -> str:
+    """Trim overly long tool results before adding to context.
+
+    Prevents a single transcription or search from blowing the token budget.
+    Preserves the head; notes how much was cut.
+    """
+    if result is None:
+        return ""
+    s = str(result)
+    if len(s) <= max_chars:
+        return s
+    omitted = len(s) - max_chars
+    return s[:max_chars] + f"\n\n... (truncated, {omitted:,} more chars omitted)"
+
+
+def extract_usage(msg):
+    """Extract token usage from an aggregated message, if available."""
+    try:
+        um = getattr(msg, "usage_metadata", None)
+        if um and isinstance(um, dict):
+            return {
+                "input": um.get("input_tokens", 0),
+                "output": um.get("output_tokens", 0),
+                "total": um.get("total_tokens", 0),
+            }
+    except Exception:
+        pass
+    try:
+        rm = getattr(msg, "response_metadata", None)
+        if rm and isinstance(rm, dict):
+            tu = rm.get("token_usage") or rm.get("usage") or {}
+            if tu:
+                return {
+                    "input": tu.get("prompt_tokens", 0),
+                    "output": tu.get("completion_tokens", 0),
+                    "total": tu.get("total_tokens", 0),
+                }
+    except Exception:
+        pass
+    return None
+
+
 # ═══════════════════════════════════════════════════════════
 #  1. MEMORY
 # ═══════════════════════════════════════════════════════════
+
 log("🧠 Loading memory...")
 try:
     vectorstore = Chroma(
@@ -75,105 +121,7 @@ except Exception as e:
 
 
 # ═══════════════════════════════════════════════════════════
-#  2. BRAIN
-#  Build an ordered list of models. LangChain's .with_fallbacks()
-#  tries each one in turn if the previous fails at runtime — so we
-#  never have to guess which model is "live" at any moment.
-# ═══════════════════════════════════════════════════════════
-log("🧠 Loading brain...")
-
-
-def _try_build(name: str, factory):
-    """Try to construct a chat model. Return None on any failure."""
-    try:
-        model = factory()
-        log(f"   ✓ {name} ready")
-        return model
-    except Exception as e:
-        log(f"   ✗ {name} failed: {type(e).__name__}: {e}")
-        return None
-
-
-def _openrouter_key():
-    return os.getenv("OPENROUTER_API_KEY")
-
-
-def build_model():
-    """Return (primary, [fallbacks]) in priority order.
-
-    Order:
-      1. OpenRouter primary model
-      2. Each OpenRouter fallback model
-      3. Groq (network may be blocked — skip silently if so)
-      4. Cerebras (trial may be expired — skip silently if so)
-      5. Cohere (only if a key is set)
-
-    At runtime, LangChain will try each in order if the previous fails.
-    """
-    models = []
-
-    # 1 + 2. OpenRouter chain
-    if _openrouter_key():
-        or_models = [config.OPENROUTER_MODEL] + config.OPENROUTER_MODEL_FALLBACKS
-        for model_id in or_models:
-            m = _try_build(
-                f"OpenRouter ({model_id})",
-                lambda mid=model_id: ChatOpenAI(
-                    model=mid,
-                    openai_api_key=_openrouter_key(),
-                    openai_api_base="https://openrouter.ai/api/v1",
-                ),
-            )
-            if m:
-                models.append(m)
-    else:
-        log("   ⚠️  OPENROUTER_API_KEY not set — skipping OpenRouter")
-
-    # 3. Groq
-    if os.getenv("GROQ_API_KEY"):
-        m = _try_build(
-            f"Groq ({config.GROQ_MODEL})",
-            lambda: ChatGroq(model=config.GROQ_MODEL),
-        )
-        if m:
-            models.append(m)
-
-    # 4. Cerebras
-    if HAS_CEREBRAS and os.getenv("CEREBRAS_API_KEY"):
-        m = _try_build(
-            f"Cerebras ({config.CEREBRAS_MODEL})",
-            lambda: ChatCerebras(model=config.CEREBRAS_MODEL),
-        )
-        if m:
-            models.append(m)
-
-    # 5. Cohere
-    if HAS_COHERE and os.getenv("COHERE_API_KEY"):
-        m = _try_build(
-            f"Cohere ({config.COHERE_MODEL})",
-            lambda: ChatCohere(model=config.COHERE_MODEL),
-        )
-        if m:
-            models.append(m)
-
-    if not models:
-        raise RuntimeError(
-            "\n\n❌ No AI model could be loaded.\n"
-            "   Open .env and make sure at least one of these is set:\n"
-            "     • OPENROUTER_API_KEY  (free: https://openrouter.ai/keys)\n"
-            "     • GROQ_API_KEY        (free: https://console.groq.com/keys)\n"
-            "     • CEREBRAS_API_KEY    (free: https://cloud.cerebras.ai)\n"
-        )
-
-    log(f"🧠 Brain chain: {len(models)} model(s) queued")
-    return models[0], models[1:]
-
-
-_primary, _fallbacks = build_model()
-
-
-# ═══════════════════════════════════════════════════════════
-#  3. TOOLS — Local file tools
+#  2. TOOLS
 # ═══════════════════════════════════════════════════════════
 
 @tool
@@ -294,10 +242,6 @@ def list_project(subpath: str = ""):
     return list_project_files(subpath)
 
 
-# ═══════════════════════════════════════════════════════════
-#  4. TOOLS — Skill library
-# ═══════════════════════════════════════════════════════════
-
 @tool
 def learn_skill(
     name: str,
@@ -307,20 +251,7 @@ def learn_skill(
     code_template: str = "",
     tags: str = "",
 ):
-    """Save a new skill to your permanent library.
-
-    Use when: (1) you figure out a complex reusable procedure,
-    (2) the user teaches you something, (3) you want to remember
-    how you solved a problem.
-
-    Args:
-        name: Short snake_case unique name.
-        description: One sentence — what does this skill do?
-        when_to_use: Trigger condition.
-        steps: Newline-separated numbered list.
-        code_template: Optional reusable code snippet.
-        tags: Comma-separated tags.
-    """
+    """Save a new skill to your permanent library."""
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     return save_skill(name, description, when_to_use, steps, code_template, tag_list)
 
@@ -330,8 +261,6 @@ def recall_skill(query: str):
     """Search your skill library semantically.
 
     REQUIRED: You MUST pass a `query` string. Never call this without a query.
-    Example: recall_skill(query="roblox kill brick")
-
     ALWAYS call this BEFORE starting a complex task.
     """
     return find_skills(query, k=3)
@@ -355,10 +284,6 @@ def forget_skill(name: str):
     return delete_skill(name)
 
 
-# ═══════════════════════════════════════════════════════════
-#  5. ASSEMBLE
-# ═══════════════════════════════════════════════════════════
-
 tools = [
     write_file, read_file, list_files,
     save_memory,
@@ -370,19 +295,129 @@ tools = [
     learn_skill, recall_skill, open_skill, list_all_skills, forget_skill,
 ]
 
-_bound = _primary.bind_tools(tools)
-if _fallbacks:
-    model_with_tools = _bound.with_fallbacks(
-        [m.bind_tools(tools) for m in _fallbacks]
-    )
-else:
-    model_with_tools = _bound
 
-log(f"✅ Brain ready! ({len(tools)} tools, {len(_fallbacks)} fallbacks)")
+# ═══════════════════════════════════════════════════════════
+#  3. BUILD MODEL CHAIN
+# ═══════════════════════════════════════════════════════════
+
+log("🧠 Loading brain...")
+
+
+def _try_build(name: str, factory):
+    try:
+        model = factory()
+        log(f"   ✓ {name} ready")
+        return model
+    except Exception as e:
+        log(f"   ✗ {name} failed: {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+
+def _openrouter_key():
+    return os.getenv("OPENROUTER_API_KEY")
+
+
+def _mistral_key():
+    return os.getenv("MISTRAL_API_KEY")
+
+
+def build_model_chain():
+    """Return list of (name, bound_model) in priority order."""
+    raw_models = []
+
+    # ── 1. Mistral (if key present — free tier, no country wall) ──
+    mk = _mistral_key()
+    if mk and mk.strip():
+        try:
+            from langchain_mistralai import ChatMistralAI
+            for model_id in [config.MISTRAL_MODEL] + config.MISTRAL_MODEL_FALLBACKS:
+                m = _try_build(
+                    f"Mistral ({model_id})",
+                    lambda mid=model_id, key=mk: ChatMistralAI(
+                        model=mid, api_key=key, timeout=60,
+                    ),
+                )
+                if m:
+                    raw_models.append((f"Mistral/{model_id}", m))
+        except ImportError:
+            log("   ⚠️  MISTRAL_API_KEY set but langchain-mistralai not installed")
+
+    # ── 2. OpenRouter ────────────────────────────────────────
+    if _openrouter_key():
+        or_models = [config.OPENROUTER_MODEL] + config.OPENROUTER_MODEL_FALLBACKS
+        for model_id in or_models:
+            m = _try_build(
+                f"OpenRouter ({model_id})",
+                lambda mid=model_id: ChatOpenAI(
+                    model=mid,
+                    openai_api_key=_openrouter_key(),
+                    openai_api_base="https://openrouter.ai/api/v1",
+                    timeout=60,
+                ),
+            )
+            if m:
+                raw_models.append((f"OpenRouter/{model_id}", m))
+
+    # ── 3. Pollinations (no key) ─────────────────────────────
+    if config.POLLINATIONS_ENABLED:
+        poll_models = [config.POLLINATIONS_MODEL] + config.POLLINATIONS_MODEL_FALLBACKS
+        for model_id in poll_models:
+            m = _try_build(
+                f"Pollinations ({model_id})",
+                lambda mid=model_id: ChatOpenAI(
+                    model=mid,
+                    openai_api_key="pollinations-no-key",
+                    openai_api_base="https://text.pollinations.ai/openai",
+                    timeout=90,
+                ),
+            )
+            if m:
+                raw_models.append((f"Pollinations/{model_id}", m))
+
+    # ── 4. Groq (if ever fixed) ──────────────────────────────
+    if HAS_GROQ and os.getenv("GROQ_API_KEY"):
+        m = _try_build(
+            "Groq (llama-3.3-70b-versatile)",
+            lambda: ChatGroq(model="llama-3.3-70b-versatile"),
+        )
+        if m:
+            raw_models.append(("Groq/llama-3.3-70b", m))
+
+    # ── 5. Cerebras (if ever paid) ───────────────────────────
+    if HAS_CEREBRAS and os.getenv("CEREBRAS_API_KEY"):
+        m = _try_build(
+            "Cerebras (gpt-oss-120b)",
+            lambda: ChatCerebras(model="gpt-oss-120b"),
+        )
+        if m:
+            raw_models.append(("Cerebras/gpt-oss-120b", m))
+
+    if not raw_models:
+        raise RuntimeError(
+            "\n\n❌ No AI model could be loaded.\n"
+            "   Open .env and set at least one of:\n"
+            "     • OPENROUTER_API_KEY   (free: https://openrouter.ai/keys)\n"
+            "     • MISTRAL_API_KEY      (free: https://console.mistral.ai/)\n"
+        )
+
+    bound = []
+    for name, m in raw_models:
+        try:
+            bound.append((name, m.bind_tools(tools)))
+        except Exception as e:
+            log(f"   ⚠️  {name} can't bind tools ({e}) — adding without tools")
+            bound.append((name + " [no tools]", m))
+
+    return bound
+
+
+_model_chain = build_model_chain()
+log(f"🧠 Brain chain: {len(_model_chain)} model(s) queued")
+log(f"✅ Brain ready! ({len(tools)} tools, {len(_model_chain)} models)")
 
 
 # ═══════════════════════════════════════════════════════════
-#  6. CORE: run one turn as a stream of events
+#  4. CORE
 # ═══════════════════════════════════════════════════════════
 
 sessions: dict = {}
@@ -405,10 +440,69 @@ def run_tool(tool_call: dict) -> str:
     if selected is None:
         return f"❌ Unknown tool: {t_name}"
     try:
-        return str(selected.invoke(t_args))
+        result = selected.invoke(t_args)
+        return truncate_tool_result(str(result), max_chars=config.TOOL_RESULT_MAX_CHARS)
     except Exception as e:
         traceback.print_exc()
         return f"❌ Tool error: {e}"
+
+
+def _stream_with_fallback(messages: list):
+    """Try each model in the chain until one streams successfully.
+
+    Yields:
+      {"type": "token", "text": "..."}
+      {"type": "usage", "input": N, "output": N, "total": N}
+
+    Returns the aggregated message via StopIteration.value.
+    """
+    errors = []
+
+    for name, model in _model_chain:
+        has_tool_history = any(
+            isinstance(m, ToolMessage) or
+            (isinstance(m, AIMessage) and getattr(m, "tool_calls", None))
+            for m in messages
+        )
+        if has_tool_history and "[no tools]" in name:
+            log(f"   ⏭️  Skipping {name} (tool history present)")
+            continue
+
+        aggregated = None
+        yielded_any = False
+
+        try:
+            log(f"   → trying {name}")
+            for chunk in model.stream(messages):
+                aggregated = chunk if aggregated is None else aggregated + chunk
+                if isinstance(chunk.content, str) and chunk.content:
+                    yielded_any = True
+                    yield {"type": "token", "text": chunk.content}
+
+            # Extract usage if available
+            if aggregated is not None:
+                usage = extract_usage(aggregated)
+                if usage:
+                    yield {"type": "usage", **usage}
+
+            return aggregated
+
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {str(e)[:200]}"
+            errors.append(f"{name}: {err_msg}")
+
+            if yielded_any:
+                log(f"   ✗ {name} failed mid-stream, giving up")
+                yield {"type": "error", "message": f"{name} failed mid-stream: {err_msg}"}
+                return None
+
+            log(f"   ✗ {name} failed: {err_msg[:100]} — trying next")
+
+    yield {
+        "type": "error",
+        "message": "All models failed. Last 3 errors:\n" + "\n".join(errors[-3:]),
+    }
+    return None
 
 
 def run_turn(user_input: str, messages: list):
@@ -418,6 +512,7 @@ def run_turn(user_input: str, messages: list):
       {"type": "token",       "text": "..."}
       {"type": "tool_call",   "id": "...", "name": "...", "args": {...}}
       {"type": "tool_result", "id": "...", "preview": "..."}
+      {"type": "usage",       "input": N, "output": N, "total": N}
       {"type": "error",       "message": "..."}
       {"type": "max_steps"}
       {"type": "done",        "answered": True/False}
@@ -436,25 +531,40 @@ def run_turn(user_input: str, messages: list):
 
     messages.append(HumanMessage(content=user_input))
 
+    total_input = 0
+    total_output = 0
+
     for step in range(config.MAX_STEPS):
         aggregated = None
         try:
-            for chunk in model_with_tools.stream(messages):
-                aggregated = chunk if aggregated is None else aggregated + chunk
-                if isinstance(chunk.content, str) and chunk.content:
-                    yield {"type": "token", "text": chunk.content}
+            gen = _stream_with_fallback(messages)
+            while True:
+                try:
+                    event = next(gen)
+                    if event.get("type") == "usage":
+                        total_input += event.get("input", 0)
+                        total_output += event.get("output", 0)
+                    yield event
+                except StopIteration as si:
+                    aggregated = si.value
+                    break
         except Exception as e:
-            traceback.print_exc()
-            yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
+            yield {"type": "error", "message": f"Model chain error: {e}"}
             return
 
         if aggregated is None:
-            yield {"type": "error", "message": "Empty response from model."}
             return
 
         messages.append(aggregated)
 
         if not aggregated.tool_calls:
+            if total_input or total_output:
+                yield {
+                    "type": "usage_total",
+                    "input": total_input,
+                    "output": total_output,
+                    "total": total_input + total_output,
+                }
             yield {"type": "done", "answered": True}
             return
 
@@ -474,7 +584,7 @@ def run_turn(user_input: str, messages: list):
 
 
 # ═══════════════════════════════════════════════════════════
-#  7. CLI LOOP
+#  5. CLI LOOP
 # ═══════════════════════════════════════════════════════════
 
 def main() -> None:
@@ -498,6 +608,8 @@ def main() -> None:
 
         print("🤖 AI: ", end="", flush=True)
 
+        turn_usage = None
+
         try:
             for event in run_turn(user_input, messages):
                 t = event["type"]
@@ -511,11 +623,21 @@ def main() -> None:
                     print(f"\n❌ {event['message']}", flush=True)
                 elif t == "max_steps":
                     print("\n⚠️  Reached max tool steps.", flush=True)
+                elif t == "usage_total":
+                    turn_usage = event
         except KeyboardInterrupt:
             print("\n⏹️  Interrupted.", flush=True)
         except Exception as e:
             print(f"\n❌ Unexpected error: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
+
+        if turn_usage:
+            print(
+                f"\n   [tokens: {turn_usage['input']} in / "
+                f"{turn_usage['output']} out / "
+                f"{turn_usage['total']} total]",
+                flush=True,
+            )
 
         print("\n")
 

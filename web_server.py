@@ -113,3 +113,17 @@ def chat(req: ChatRequest):
             yield f"data: {json.dumps(payload)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ═══════════════════════════════════════════════════════════
+#  STARTUP — this is the part that was missing
+# ═══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "=" * 55)
+    print("  🌐 Web UI starting...")
+    print("  → Open http://127.0.0.1:8000 in your browser")
+    print("  → Press CTRL+C here to stop the server")
+    print("=" * 55 + "\n")
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")

@@ -22,12 +22,12 @@ load_dotenv()
 
 # ============================================================
 #  LAZY CLIENT LOADERS
-#  Nothing is built at import time — a bad/missing key only
-#  breaks the one tool that needs it, never the whole app.
 # ============================================================
 
 _groq_client = None
 _hf_client = None
+_local_whisper = None
+_local_whisper_size = None
 
 
 def _need(name: str) -> str:
@@ -53,8 +53,20 @@ def get_hf():
     return _hf_client
 
 
+def get_local_whisper(size: str = None):
+    """Load (and cache) the local faster-whisper model."""
+    global _local_whisper, _local_whisper_size
+    size = size or os.getenv("WHISPER_MODEL", "base")
+    if _local_whisper is None or _local_whisper_size != size:
+        from faster_whisper import WhisperModel
+        print(f"   📥 Loading local Whisper '{size}' (first time = download)...")
+        _local_whisper = WhisperModel(size, device="cpu", compute_type="int8")
+        _local_whisper_size = size
+        print(f"   ✅ Local Whisper '{size}' ready")
+    return _local_whisper
+
+
 def _vision_candidates():
-    """Return list of vision models to try, in order."""
     import config
     return [config.VISION_MODEL] + list(config.VISION_MODEL_FALLBACKS)
 
@@ -215,7 +227,7 @@ def scan_workspace() -> str:
 
 
 # ============================================================
-#  AUDIO (YouTube → text, with HF Whisper fallback)
+#  AUDIO (YouTube → text)
 # ============================================================
 
 def download_youtube_audio(url: str) -> str:
@@ -243,7 +255,7 @@ def download_youtube_audio(url: str) -> str:
     return "downloaded_audio.mp3"
 
 
-def _split_audio_if_needed(audio_path: str, max_mb: int = 24) -> list:
+def _split_audio_if_needed(audio_path: str, max_mb: int = 100) -> list:
     if not os.path.exists(audio_path):
         return [audio_path]
     size_mb = os.path.getsize(audio_path) / (1024 * 1024)
@@ -251,8 +263,8 @@ def _split_audio_if_needed(audio_path: str, max_mb: int = 24) -> list:
     if size_mb <= max_mb:
         return [audio_path]
 
-    print(f"   ⚠️ File too big, splitting...")
-    chunk_duration = 600
+    print(f"   ⚠️ Very large file, splitting...")
+    chunk_duration = 900
     chunks = []
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -279,30 +291,84 @@ def _split_audio_if_needed(audio_path: str, max_mb: int = 24) -> list:
     return chunks
 
 
-def _transcribe_chunk(chunk_path: str) -> str:
-    """Try Groq Whisper first, fall back to HF Whisper if Groq is blocked."""
-    # --- Groq attempt ---
-    try:
-        with open(chunk_path, "rb") as f:
-            return get_groq().audio.transcriptions.create(
-                file=(chunk_path, f.read()),
-                model="whisper-large-v3-turbo",
-                response_format="text",
-            )
-    except Exception as e:
-        print(f"   ⚠️ Groq transcription failed ({type(e).__name__}), trying HF...")
+def _transcribe_local(chunk_path: str) -> str:
+    model = get_local_whisper()
+    segments, info = model.transcribe(chunk_path, beam_size=1, vad_filter=True)
+    return " ".join(seg.text for seg in segments).strip()
 
-    # --- HF fallback ---
-    try:
-        with open(chunk_path, "rb") as f:
-            audio_bytes = f.read()
-        result = get_hf().automatic_speech_recognition(
-            audio_bytes,
-            model="openai/whisper-large-v3",
+
+def _transcribe_groq(chunk_path: str) -> str:
+    with open(chunk_path, "rb") as f:
+        return get_groq().audio.transcriptions.create(
+            file=(chunk_path, f.read()),
+            model="whisper-large-v3-turbo",
+            response_format="text",
         )
-        return result.text if hasattr(result, "text") else str(result)
+
+
+def _transcribe_hf(chunk_path: str) -> str:
+    with open(chunk_path, "rb") as f:
+        audio_bytes = f.read()
+    result = get_hf().automatic_speech_recognition(
+        audio_bytes, model="openai/whisper-large-v3",
+    )
+    return result.text if hasattr(result, "text") else str(result)
+
+
+def _transcribe_openrouter(chunk_path: str) -> str:
+    with open(chunk_path, "rb") as f:
+        audio_bytes = f.read()
+    r = requests.post(
+        "https://openrouter.ai/api/v1/audio/transcriptions",
+        headers={
+            "Authorization": f"Bearer {_need('OPENROUTER_API_KEY')}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": os.getenv("OPENROUTER_STT_MODEL", "x-ai/grok-stt-1.0"),
+            "input_audio": {
+                "data": base64.b64encode(audio_bytes).decode(),
+                "format": "mp3",
+            },
+        },
+        timeout=120,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    return r.json().get("text", "")
+
+
+def _transcribe_chunk(chunk_path: str) -> str:
+    """Try every transcriber in order; return first success. Local first."""
+    try:
+        return _transcribe_local(chunk_path)
+    except ImportError:
+        print("   ⚠️ faster-whisper not installed — try: pip install faster-whisper")
     except Exception as e:
-        return f"[transcription failed: {e}]"
+        print(f"   ⚠️ Local Whisper failed ({type(e).__name__}): {e}")
+
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            print("   🔁 Trying Groq Whisper...")
+            return _transcribe_groq(chunk_path)
+        except Exception as e:
+            print(f"   ⚠️ Groq failed ({type(e).__name__})")
+
+    if os.getenv("HF_TOKEN"):
+        try:
+            print("   🔁 Trying HF Whisper...")
+            return _transcribe_hf(chunk_path)
+        except Exception as e:
+            print(f"   ⚠️ HF failed ({type(e).__name__})")
+
+    if os.getenv("OPENROUTER_API_KEY"):
+        try:
+            print("   🔁 Trying OpenRouter STT...")
+            return _transcribe_openrouter(chunk_path)
+        except Exception as e:
+            print(f"   ⚠️ OpenRouter STT failed ({type(e).__name__})")
+
+    return "[transcription failed: all providers unavailable]"
 
 
 def youtube_to_text(url: str) -> str:
@@ -363,7 +429,6 @@ def _extract_keyframes(video_path: str, output_folder: str = "video_frames",
 
 
 def _analyze_frame(image_path: str, question: str) -> str:
-    """Try each vision model in order until one works."""
     from langchain_core.messages import HumanMessage
     from langchain_openai import ChatOpenAI
 
@@ -453,7 +518,7 @@ def watch_video(url: str, frame_interval: int = 10, max_frames: int = 6) -> str:
 
 
 # ============================================================
-#  WEB SEARCH  (uses the new `ddgs` package)
+#  WEB SEARCH
 # ============================================================
 
 def web_search(query: str, max_results: int = 4) -> str:
@@ -479,7 +544,7 @@ def web_search(query: str, max_results: int = 4) -> str:
 
 
 # ============================================================
-#  IMAGE GENERATION (HF, with free Pollinations fallback)
+#  IMAGE GENERATION
 # ============================================================
 
 def generate_image(prompt: str) -> str:
@@ -489,7 +554,6 @@ def generate_image(prompt: str) -> str:
     ).strip().replace(" ", "_") or "generated"
     filepath = os.path.join("ai_creations", f"image_{safe}.png")
 
-    # Try HuggingFace first
     try:
         print(f"🎨 HF FLUX: {prompt}")
         image = get_hf().text_to_image(
@@ -501,7 +565,6 @@ def generate_image(prompt: str) -> str:
     except Exception as e:
         print(f"   HF failed ({e}), trying Pollinations...")
 
-    # Fallback: Pollinations (free, no key)
     try:
         from io import BytesIO
         from PIL import Image
@@ -519,7 +582,7 @@ def generate_image(prompt: str) -> str:
 
 
 # ============================================================
-#  3D MODEL (three.ws — best-effort, may be down)
+#  3D MODEL
 # ============================================================
 
 def generate_3d_model(prompt: str, max_polls: int = 30) -> str:
@@ -533,6 +596,13 @@ def generate_3d_model(prompt: str, max_polls: int = 30) -> str:
         )
         if response.status_code == 429:
             return f"⏳ Rate limited. Retry in {response.headers.get('Retry-After', '30')}s."
+        if response.status_code == 503:
+            return (
+                "⚠️ three.ws free 3D generation is currently disabled server-side "
+                "(503 not_configured). This is not a bug in your setup — the "
+                "service owner turned off the free tier. Try again later or use "
+                "Blender/Meshy/TripoSR as an alternative."
+            )
         if response.status_code != 200:
             return f"❌ three.ws error {response.status_code}: {response.text[:300]}"
 
@@ -585,33 +655,120 @@ def generate_3d_model(prompt: str, max_polls: int = 30) -> str:
 
 
 # ============================================================
-#  TEXT-TO-SPEECH
+#  TEXT-TO-SPEECH — Multi-tier fallback
+#  1. edge-tts (best quality, may be 403'd by Microsoft)
+#  2. gTTS     (reliable online, Google)
+#  3. pyttsx3  (offline, Windows built-in)
+#  4. ttsfm    (free OpenAI.fm clone, no key)
 # ============================================================
 
-async def _speak_async(text, filename, voice, rate):
+async def _edge_speak_async(text, filename, voice, rate):
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     await communicate.save(filename)
+
+
+def _tts_edge(text: str, filepath: str, voice: str, rate: str):
+    asyncio.run(_edge_speak_async(text, filepath, voice, rate))
+    if not os.path.exists(filepath) or os.path.getsize(filepath) < 1000:
+        raise RuntimeError("edge-tts produced no/small file (likely 403)")
+
+
+def _tts_gtts(text: str, filepath: str):
+    from gtts import gTTS
+    gTTS(text=text, lang="en").save(filepath)
+    if not os.path.exists(filepath) or os.path.getsize(filepath) < 500:
+        raise RuntimeError("gTTS produced no/small file")
+
+
+def _tts_pyttsx3(text: str, filepath: str):
+    import pyttsx3
+    wav_path = filepath.rsplit(".", 1)[0] + ".wav"
+    engine = pyttsx3.init()
+    engine.save_to_file(text, wav_path)
+    engine.runAndWait()
+    if not os.path.exists(wav_path):
+        raise RuntimeError("pyttsx3 did not produce a wav file")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", wav_path, filepath,
+         "-hide_banner", "-loglevel", "error"],
+        check=True,
+    )
+    try:
+        os.remove(wav_path)
+    except Exception:
+        pass
+
+
+def _tts_ttsfm(text: str, filepath: str):
+    from ttsfm import TTSClient, Voice, AudioFormat
+    client = TTSClient()
+    response = client.generate_speech(
+        text=text,
+        voice=Voice.CORAL,
+        response_format=AudioFormat.MP3,
+    )
+    # ttsfm's save_to_file takes path WITHOUT extension
+    base = filepath.rsplit(".", 1)[0]
+    response.save_to_file(base)
+    # Verify some file was actually written
+    import glob as _glob
+    candidates = _glob.glob(base + ".*")
+    if not candidates:
+        raise RuntimeError("ttsfm produced no file")
 
 
 def text_to_speech(text: str, filename: str = "ai_voice.mp3",
                    voice: str = "en-US-GuyNeural",
                    rate: str = "+0%") -> str:
+    os.makedirs("ai_creations", exist_ok=True)
+    filepath = os.path.join("ai_creations", filename)
+
+    # 1. edge-tts
     try:
-        os.makedirs("ai_creations", exist_ok=True)
-        filepath = os.path.join("ai_creations", filename)
-        asyncio.run(_speak_async(text, filepath, voice, rate))
-        return f"✅ Voice saved to: {filepath}"
+        print(f"🔊 edge-tts: {voice}")
+        _tts_edge(text, filepath, voice, rate)
+        return f"✅ Voice saved to: {filepath} (edge-tts)"
     except Exception as e:
-        return f"Voice error: {e}"
+        print(f"   ⚠️ edge-tts failed ({type(e).__name__}: {str(e)[:120]})")
+
+    # 2. gTTS
+    try:
+        print("   🔁 Trying gTTS...")
+        _tts_gtts(text, filepath)
+        return f"✅ Voice saved to: {filepath} (gTTS)"
+    except ImportError:
+        print("   ⚠️ gTTS not installed — pip install gTTS")
+    except Exception as e:
+        print(f"   ⚠️ gTTS failed ({type(e).__name__}: {str(e)[:120]})")
+
+    # 3. pyttsx3 (offline)
+    try:
+        print("   🔁 Trying pyttsx3 (offline)...")
+        _tts_pyttsx3(text, filepath)
+        return f"✅ Voice saved to: {filepath} (pyttsx3, offline)"
+    except ImportError:
+        print("   ⚠️ pyttsx3 not installed — pip install pyttsx3")
+    except Exception as e:
+        print(f"   ⚠️ pyttsx3 failed ({type(e).__name__}: {str(e)[:120]})")
+
+    # 4. ttsfm
+    try:
+        print("   🔁 Trying ttsfm...")
+        _tts_ttsfm(text, filepath)
+        return f"✅ Voice saved to: {filepath} (ttsfm)"
+    except ImportError:
+        print("   ⚠️ ttsfm not installed — pip install ttsfm")
+    except Exception as e:
+        print(f"   ⚠️ ttsfm failed ({type(e).__name__}: {str(e)[:120]})")
+
+    return "❌ All TTS providers failed (edge-tts, gTTS, pyttsx3, ttsfm)"
 
 
 # ============================================================
-#  CODE EXECUTION — local subprocess (free, instant, unlimited)
+#  CODE EXECUTION
 # ============================================================
 
 def run_python_code(code: str) -> str:
-    """Run Python locally in a sandboxed subprocess with timeout.
-    No API key, no rate limits, no waiting for a cloud service."""
     path = None
     try:
         print("💻 Running code locally...")

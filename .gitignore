@@ -1,17 +1,61 @@
+# ═══ SECRETS — NEVER COMMIT ═══
 .env
+.env.*
+!.env.example
 text.txt
-*.env
+*.key
+*.pem
+credentials.json
+
+# ═══ VIRTUAL ENVIRONMENTS ═══
+venv/
+.venv/
+env/
+ENV/
+
+# ═══ PYTHON ═══
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ═══ PROJECT DATA — generated at runtime ═══
 chroma_db/
+skills_db/
 ai_creations/
 workspace.json
 video_frames/
 downloaded_*
 *.mp3
 *.mp4
-skills_db/
+*.wav
 skills.json
-.pytest_cache/
-venv/
-.venv/
+
+# ═══ HUGGINGFACE CACHE ═══
+.cache/
+huggingface/
+
+# ═══ IDE / OS ═══
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ═══ LOGS ═══
+*.log
+logs/
+
+# ═══ TEST OUTPUT ═══
+.coverage
+htmlcov/
