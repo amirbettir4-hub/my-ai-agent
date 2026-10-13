@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# ── OpenRouter (primary) ─────────────────────────────────────
+# ── OpenRouter ───────────────────────────────────────────────
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 OPENROUTER_MODEL_FALLBACKS = [
     m.strip() for m in os.getenv(
@@ -14,12 +14,11 @@ OPENROUTER_MODEL_FALLBACKS = [
     ).split(",") if m.strip()
 ]
 
-# ── Mistral (if key present) ─────────────────────────────────
+# ── Mistral ──────────────────────────────────────────────────
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_MODEL_FALLBACKS = [
     m.strip() for m in os.getenv(
-        "MISTRAL_MODEL_FALLBACKS",
-        "open-mistral-nemo",
+        "MISTRAL_MODEL_FALLBACKS", "open-mistral-nemo"
     ).split(",") if m.strip()
 ]
 
@@ -28,8 +27,7 @@ POLLINATIONS_ENABLED = os.getenv("POLLINATIONS_ENABLED", "true").lower() == "tru
 POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "openai")
 POLLINATIONS_MODEL_FALLBACKS = [
     m.strip() for m in os.getenv(
-        "POLLINATIONS_MODEL_FALLBACKS",
-        "mistral",
+        "POLLINATIONS_MODEL_FALLBACKS", "mistral"
     ).split(",") if m.strip()
 ]
 
@@ -45,13 +43,31 @@ VISION_MODEL_FALLBACKS = [
 # ── Agent loop ───────────────────────────────────────────────
 MAX_STEPS = 6
 MEMORY_K  = 2
-
-# ── Tool output truncation ───────────────────────────────────
 TOOL_RESULT_MAX_CHARS = 4000
 
-# ── Memory ───────────────────────────────────────────────────
-CHROMA_DIR        = "./chroma_db"
-CHROMA_COLLECTION = "my_ai_memory"
+# ── Smart mode toggles ───────────────────────────────────────
+SMART_PLANNING   = os.getenv("SMART_PLANNING",   "true").lower() == "true"
+SMART_REFLECTION = os.getenv("SMART_REFLECTION", "true").lower() == "true"
+SMART_SUBAGENTS  = os.getenv("SMART_SUBAGENTS",  "true").lower() == "true"
+
+# Reflection only runs when the answer is longer than this
+REFLECTION_MIN_CHARS = 600
+# Planning only runs when the request is longer than this
+PLANNING_MIN_CHARS   = 80
+
+# ── Document RAG ─────────────────────────────────────────────
+RAG_DIR           = os.getenv("RAG_DIR", "./documents")
+RAG_CHUNK_SIZE    = 800
+RAG_CHUNK_OVERLAP = 100
+RAG_TOP_K         = 3
+
+# ── Multi-session projects ───────────────────────────────────
+PROJECTS_FILE = "./projects.json"
+
+# ── Memory (Chroma) ──────────────────────────────────────────
+CHROMA_DIR            = "./chroma_db"
+CHROMA_COLLECTION     = "my_ai_memory"
+CHROMA_RAG_COLLECTION = "user_documents"
 
 # ── UI ───────────────────────────────────────────────────────
 VERBOSE = True

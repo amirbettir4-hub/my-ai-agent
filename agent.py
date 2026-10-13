@@ -1,14 +1,9 @@
 """
-agent.py — The Brain.
-
-Multi-model agent with tool calling, memory, streaming, and a persistent
-skill library.
-
-Manual fallback chain: if a model errors BEFORE yielding any token,
-the next model is tried.
+agent.py — The Brain (Smart Edition).
 """
 
 import os
+import re
 import sys
 import traceback
 
@@ -40,51 +35,41 @@ from tools import (
     write_project_file, read_project_file, list_project_files,
     scan_workspace, generate_3d_model, watch_video,
 )
-
 from skills import (
     save_skill, find_skills, get_skill, list_skills, delete_skill,
 )
-
+import rag
+import projects as proj
 import config
-from prompts import build_system_prompt
+from prompts import (
+    build_system_prompt, PLANNING_SYSTEM, REFLECTION_SYSTEM,
+)
 
 load_dotenv()
 
-
-# ═══════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════
 
 def log(msg: str) -> None:
     if config.VERBOSE:
         print(msg)
 
 
-def truncate_tool_result(result: str, max_chars: int = 4000) -> str:
-    """Trim overly long tool results before adding to context.
-
-    Prevents a single transcription or search from blowing the token budget.
-    Preserves the head; notes how much was cut.
-    """
+def truncate_tool_result(result: str, max_chars: int = None) -> str:
+    max_chars = max_chars or config.TOOL_RESULT_MAX_CHARS
     if result is None:
         return ""
     s = str(result)
     if len(s) <= max_chars:
         return s
-    omitted = len(s) - max_chars
-    return s[:max_chars] + f"\n\n... (truncated, {omitted:,} more chars omitted)"
+    return s[:max_chars] + f"\n\n... (truncated, {len(s)-max_chars:,} more chars omitted)"
 
 
 def extract_usage(msg):
-    """Extract token usage from an aggregated message, if available."""
     try:
         um = getattr(msg, "usage_metadata", None)
         if um and isinstance(um, dict):
-            return {
-                "input": um.get("input_tokens", 0),
-                "output": um.get("output_tokens", 0),
-                "total": um.get("total_tokens", 0),
-            }
+            return {"input": um.get("input_tokens", 0),
+                    "output": um.get("output_tokens", 0),
+                    "total": um.get("total_tokens", 0)}
     except Exception:
         pass
     try:
@@ -92,20 +77,15 @@ def extract_usage(msg):
         if rm and isinstance(rm, dict):
             tu = rm.get("token_usage") or rm.get("usage") or {}
             if tu:
-                return {
-                    "input": tu.get("prompt_tokens", 0),
-                    "output": tu.get("completion_tokens", 0),
-                    "total": tu.get("total_tokens", 0),
-                }
+                return {"input": tu.get("prompt_tokens", 0),
+                        "output": tu.get("completion_tokens", 0),
+                        "total": tu.get("total_tokens", 0)}
     except Exception:
         pass
     return None
 
 
-# ═══════════════════════════════════════════════════════════
-#  1. MEMORY
-# ═══════════════════════════════════════════════════════════
-
+# ═══ MEMORY ═══
 log("🧠 Loading memory...")
 try:
     vectorstore = Chroma(
@@ -114,15 +94,12 @@ try:
     )
     _memory_ok = True
 except Exception as e:
-    log(f"⚠️  Memory store failed to load: {e}")
-    log("   → Continuing without long-term memory.")
+    log(f"⚠️  Memory failed: {e}")
     vectorstore = None
     _memory_ok = False
 
 
-# ═══════════════════════════════════════════════════════════
-#  2. TOOLS
-# ═══════════════════════════════════════════════════════════
+# ═══ TOOLS ═══
 
 @tool
 def write_file(filename: str, content: str):
@@ -156,7 +133,7 @@ def list_files():
 def save_memory(fact: str):
     """Saves an important fact to long-term memory."""
     if vectorstore is None:
-        return "⚠️ Memory store unavailable — fact not saved."
+        return "⚠️ Memory unavailable."
     try:
         vectorstore.add_texts([fact])
         return f"💾 Remembered: {fact}"
@@ -243,14 +220,8 @@ def list_project(subpath: str = ""):
 
 
 @tool
-def learn_skill(
-    name: str,
-    description: str,
-    when_to_use: str,
-    steps: str,
-    code_template: str = "",
-    tags: str = "",
-):
+def learn_skill(name: str, description: str, when_to_use: str,
+                steps: str, code_template: str = "", tags: str = ""):
     """Save a new skill to your permanent library."""
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     return save_skill(name, description, when_to_use, steps, code_template, tag_list)
@@ -258,17 +229,13 @@ def learn_skill(
 
 @tool
 def recall_skill(query: str):
-    """Search your skill library semantically.
-
-    REQUIRED: You MUST pass a `query` string. Never call this without a query.
-    ALWAYS call this BEFORE starting a complex task.
-    """
+    """Search your skill library semantically. MUST pass a query."""
     return find_skills(query, k=3)
 
 
 @tool
 def open_skill(name: str):
-    """Open a specific skill to see its full steps and code template."""
+    """Open a specific skill."""
     return get_skill(name)
 
 
@@ -280,8 +247,63 @@ def list_all_skills():
 
 @tool
 def forget_skill(name: str):
-    """Permanently delete a skill from the library."""
+    """Delete a skill."""
     return delete_skill(name)
+
+
+@tool
+def index_my_documents(force: bool = False):
+    """Index files in ./documents/ for local search."""
+    return rag.index_documents(force=force)
+
+
+@tool
+def search_my_documents(query: str):
+    """Search inside your indexed documents."""
+    return rag.search_documents(query)
+
+
+@tool
+def create_project(name: str, goal: str = ""):
+    """Create a multi-session project."""
+    return proj.create_project(name, goal)
+
+
+@tool
+def list_projects(include_done: bool = False):
+    """List all projects."""
+    return proj.list_projects(include_done=include_done)
+
+
+@tool
+def get_project_details(project_id: str):
+    """Get project details."""
+    return proj.get_project(project_id)
+
+
+@tool
+def update_project_notes(project_id: str, notes: str = None,
+                         status: str = None, goal: str = None):
+    """Update project fields."""
+    return proj.update_project(project_id, notes=notes, status=status, goal=goal)
+
+
+@tool
+def add_project_step(project_id: str, text: str):
+    """Add a step to a project."""
+    return proj.add_project_step(project_id, text)
+
+
+@tool
+def complete_project_step(project_id: str, step_number: int):
+    """Mark a step done."""
+    return proj.complete_project_step(project_id, step_number)
+
+
+@tool
+def delete_project(project_id: str):
+    """Delete a project."""
+    return proj.delete_project(project_id)
 
 
 tools = [
@@ -293,21 +315,22 @@ tools = [
     set_project_workspace, get_project_workspace, scan_project,
     write_project, read_project, list_project,
     learn_skill, recall_skill, open_skill, list_all_skills, forget_skill,
+    index_my_documents, search_my_documents,
+    create_project, list_projects, get_project_details,
+    update_project_notes, add_project_step, complete_project_step,
+    delete_project,
 ]
 
 
-# ═══════════════════════════════════════════════════════════
-#  3. BUILD MODEL CHAIN
-# ═══════════════════════════════════════════════════════════
-
+# ═══ BRAIN ═══
 log("🧠 Loading brain...")
 
 
-def _try_build(name: str, factory):
+def _try_build(name, factory):
     try:
-        model = factory()
+        m = factory()
         log(f"   ✓ {name} ready")
-        return model
+        return m
     except Exception as e:
         log(f"   ✗ {name} failed: {type(e).__name__}: {str(e)[:100]}")
         return None
@@ -322,10 +345,8 @@ def _mistral_key():
 
 
 def build_model_chain():
-    """Return list of (name, bound_model) in priority order."""
-    raw_models = []
+    raw = []
 
-    # ── 1. Mistral (if key present — free tier, no country wall) ──
     mk = _mistral_key()
     if mk and mk.strip():
         try:
@@ -334,103 +355,189 @@ def build_model_chain():
                 m = _try_build(
                     f"Mistral ({model_id})",
                     lambda mid=model_id, key=mk: ChatMistralAI(
-                        model=mid, api_key=key, timeout=60,
-                    ),
+                        model=mid, api_key=key, timeout=60),
                 )
                 if m:
-                    raw_models.append((f"Mistral/{model_id}", m))
+                    raw.append((f"Mistral/{model_id}", m))
         except ImportError:
-            log("   ⚠️  MISTRAL_API_KEY set but langchain-mistralai not installed")
+            log("   ⚠️  langchain-mistralai not installed")
 
-    # ── 2. OpenRouter ────────────────────────────────────────
     if _openrouter_key():
-        or_models = [config.OPENROUTER_MODEL] + config.OPENROUTER_MODEL_FALLBACKS
-        for model_id in or_models:
+        for model_id in [config.OPENROUTER_MODEL] + config.OPENROUTER_MODEL_FALLBACKS:
             m = _try_build(
                 f"OpenRouter ({model_id})",
                 lambda mid=model_id: ChatOpenAI(
                     model=mid,
                     openai_api_key=_openrouter_key(),
                     openai_api_base="https://openrouter.ai/api/v1",
-                    timeout=60,
-                ),
+                    timeout=60),
             )
             if m:
-                raw_models.append((f"OpenRouter/{model_id}", m))
+                raw.append((f"OpenRouter/{model_id}", m))
 
-    # ── 3. Pollinations (no key) ─────────────────────────────
     if config.POLLINATIONS_ENABLED:
-        poll_models = [config.POLLINATIONS_MODEL] + config.POLLINATIONS_MODEL_FALLBACKS
-        for model_id in poll_models:
+        for model_id in [config.POLLINATIONS_MODEL] + config.POLLINATIONS_MODEL_FALLBACKS:
             m = _try_build(
                 f"Pollinations ({model_id})",
                 lambda mid=model_id: ChatOpenAI(
                     model=mid,
                     openai_api_key="pollinations-no-key",
                     openai_api_base="https://text.pollinations.ai/openai",
-                    timeout=90,
-                ),
+                    timeout=90),
             )
             if m:
-                raw_models.append((f"Pollinations/{model_id}", m))
+                raw.append((f"Pollinations/{model_id}", m))
 
-    # ── 4. Groq (if ever fixed) ──────────────────────────────
     if HAS_GROQ and os.getenv("GROQ_API_KEY"):
-        m = _try_build(
-            "Groq (llama-3.3-70b-versatile)",
-            lambda: ChatGroq(model="llama-3.3-70b-versatile"),
-        )
+        m = _try_build("Groq (llama-3.3-70b-versatile)",
+                       lambda: ChatGroq(model="llama-3.3-70b-versatile"))
         if m:
-            raw_models.append(("Groq/llama-3.3-70b", m))
+            raw.append(("Groq/llama-3.3-70b", m))
 
-    # ── 5. Cerebras (if ever paid) ───────────────────────────
     if HAS_CEREBRAS and os.getenv("CEREBRAS_API_KEY"):
-        m = _try_build(
-            "Cerebras (gpt-oss-120b)",
-            lambda: ChatCerebras(model="gpt-oss-120b"),
-        )
+        m = _try_build("Cerebras (gpt-oss-120b)",
+                       lambda: ChatCerebras(model="gpt-oss-120b"))
         if m:
-            raw_models.append(("Cerebras/gpt-oss-120b", m))
+            raw.append(("Cerebras/gpt-oss-120b", m))
 
-    if not raw_models:
-        raise RuntimeError(
-            "\n\n❌ No AI model could be loaded.\n"
-            "   Open .env and set at least one of:\n"
-            "     • OPENROUTER_API_KEY   (free: https://openrouter.ai/keys)\n"
-            "     • MISTRAL_API_KEY      (free: https://console.mistral.ai/)\n"
-        )
+    if not raw:
+        raise RuntimeError("❌ No AI model could be loaded. Check .env")
 
     bound = []
-    for name, m in raw_models:
+    for name, m in raw:
         try:
             bound.append((name, m.bind_tools(tools)))
-        except Exception as e:
-            log(f"   ⚠️  {name} can't bind tools ({e}) — adding without tools")
+        except Exception:
             bound.append((name + " [no tools]", m))
-
-    return bound
-
-
-_model_chain = build_model_chain()
-log(f"🧠 Brain chain: {len(_model_chain)} model(s) queued")
-log(f"✅ Brain ready! ({len(tools)} tools, {len(_model_chain)} models)")
+    return bound, raw
 
 
-# ═══════════════════════════════════════════════════════════
-#  4. CORE
-# ═══════════════════════════════════════════════════════════
+_model_chain, _raw_model_chain = build_model_chain()
+log(f"🧠 Brain chain: {len(_model_chain)} tool-capable + {len(_raw_model_chain)} raw")
+
+
+# ═══ MODE DETECTION ═══
+
+RESEARCH_VERBS = [
+    "search", "find", "look up", "lookup", "research",
+    "google", "search for", "find me", "what's new",
+]
+CODER_KW = ["code", "script", "function", "bug", "debug", "implement",
+            "compile", "refactor", "algorithm", "syntax"]
+RESEARCHER_KW = ["what is", "what's", "explain", "compare", "latest",
+                 "news", "how does", "tell me about", "who is", "tutorial"]
+PLANNER_KW = ["plan", "steps", "strategy", "roadmap", "break down",
+              "how to build", "how do i"]
+
+
+def detect_mode(user_input: str) -> str:
+    text = user_input.lower().strip()
+    # Priority 1: any research verb anywhere in the first 60 chars
+    head = text[:60]
+    if any(v in head for v in RESEARCH_VERBS):
+        return "researcher"
+
+    c = sum(1 for k in CODER_KW if k in text)
+    r = sum(1 for k in RESEARCHER_KW if k in text)
+    p = sum(1 for k in PLANNER_KW if k in text)
+
+    if p > 0 and p >= c and p >= r:
+        return "planner"
+    if c > r and c > 0:
+        return "coder"
+    if r > 0:
+        return "researcher"
+    return "general"
+
+
+# ═══ FORCED TOOL DETECTION ═══
+# If the message clearly wants a specific tool, we inject a system message
+# demanding the model call it. This prevents the "answer from memory" bug.
+
+FORCED_TOOL_PATTERNS = [
+    (["search", "google", "look up", "find online", "research"],
+     "search_web",
+     "The user wants a web search. You MUST call `search_web` before answering. "
+     "Do NOT answer from memory. Do NOT invent URLs."),
+    (["search my documents", "search my docs", "search my files"],
+     "search_my_documents",
+     "The user wants to search their local documents. You MUST call `search_my_documents`."),
+    (["transcribe"],
+     "transcribe_youtube",
+     "The user wants a transcription. You MUST call `transcribe_youtube` with the URL."),
+    (["generate image", "create image", "draw", "make an image"],
+     "create_image",
+     "The user wants an image. You MUST call `create_image`."),
+]
+
+
+def detect_forced_tool(user_input: str):
+    """Return (tool_name, reminder) if the message clearly needs a tool."""
+    text = user_input.lower()
+    for keywords, tool_name, reminder in FORCED_TOOL_PATTERNS:
+        if any(k in text for k in keywords):
+            return tool_name, reminder
+    return None, None
+
+
+# ═══ SMART STAGES ═══
+
+ACTION_VERBS = ["build", "create", "make", "implement", "design",
+                "develop", "set up", "setup", "write a", "generate",
+                "produce", "fix"]
+
+
+def needs_planning(user_input: str) -> bool:
+    text = user_input.lower()
+    if len(user_input) < config.PLANNING_MIN_CHARS:
+        if not any(v in text for v in ACTION_VERBS):
+            return False
+    has_action = any(v in text for v in ACTION_VERBS)
+    is_long = len(user_input) > 120
+    has_multi = (text.count(" and ") >= 1 or text.count(",") >= 2
+                 or text.count("\n") >= 1)
+    return has_action or is_long or has_multi
+
+
+def _quick_call(system_prompt: str, user_prompt: str) -> str | None:
+    msgs = [SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)]
+    for name, model in _raw_model_chain:
+        try:
+            log(f"      one-shot via {name}")
+            r = model.invoke(msgs)
+            content = getattr(r, "content", r)
+            if isinstance(content, list):
+                content = " ".join(str(c) for c in content)
+            return str(content).strip()
+        except Exception as e:
+            log(f"      ✗ {name}: {type(e).__name__}")
+            continue
+    return None
+
+
+def _extract_plan(text: str) -> list[str]:
+    if not text:
+        return []
+    steps = []
+    for line in text.splitlines():
+        m = re.match(r'^\s*(?:\d+[\.\)]|[\-\*])\s+(.+)$', line.strip())
+        if m:
+            steps.append(m.group(1).strip())
+    return steps[:6]
+
 
 sessions: dict = {}
 
 
 def get_memory_context(user_input: str) -> str:
     if vectorstore is None:
-        return "Memory unavailable."
+        return "unavailable"
     try:
         memories = vectorstore.similarity_search(user_input, k=config.MEMORY_K)
-        return "\n".join(m.page_content for m in memories) if memories else "No memories yet."
+        return "\n".join(m.page_content for m in memories) if memories else "none"
     except Exception:
-        return "Memory unavailable."
+        return "unavailable"
 
 
 def run_tool(tool_call: dict) -> str:
@@ -441,23 +548,14 @@ def run_tool(tool_call: dict) -> str:
         return f"❌ Unknown tool: {t_name}"
     try:
         result = selected.invoke(t_args)
-        return truncate_tool_result(str(result), max_chars=config.TOOL_RESULT_MAX_CHARS)
+        return truncate_tool_result(str(result))
     except Exception as e:
         traceback.print_exc()
         return f"❌ Tool error: {e}"
 
 
 def _stream_with_fallback(messages: list):
-    """Try each model in the chain until one streams successfully.
-
-    Yields:
-      {"type": "token", "text": "..."}
-      {"type": "usage", "input": N, "output": N, "total": N}
-
-    Returns the aggregated message via StopIteration.value.
-    """
     errors = []
-
     for name, model in _model_chain:
         has_tool_history = any(
             isinstance(m, ToolMessage) or
@@ -465,12 +563,10 @@ def _stream_with_fallback(messages: list):
             for m in messages
         )
         if has_tool_history and "[no tools]" in name:
-            log(f"   ⏭️  Skipping {name} (tool history present)")
             continue
 
         aggregated = None
         yielded_any = False
-
         try:
             log(f"   → trying {name}")
             for chunk in model.stream(messages):
@@ -478,61 +574,68 @@ def _stream_with_fallback(messages: list):
                 if isinstance(chunk.content, str) and chunk.content:
                     yielded_any = True
                     yield {"type": "token", "text": chunk.content}
-
-            # Extract usage if available
             if aggregated is not None:
                 usage = extract_usage(aggregated)
                 if usage:
                     yield {"type": "usage", **usage}
-
             return aggregated
-
         except Exception as e:
             err_msg = f"{type(e).__name__}: {str(e)[:200]}"
             errors.append(f"{name}: {err_msg}")
-
             if yielded_any:
-                log(f"   ✗ {name} failed mid-stream, giving up")
                 yield {"type": "error", "message": f"{name} failed mid-stream: {err_msg}"}
                 return None
+            log(f"   ✗ {name}: {err_msg[:100]}")
 
-            log(f"   ✗ {name} failed: {err_msg[:100]} — trying next")
-
-    yield {
-        "type": "error",
-        "message": "All models failed. Last 3 errors:\n" + "\n".join(errors[-3:]),
-    }
+    yield {"type": "error",
+           "message": "All models failed. Last 3 errors:\n" + "\n".join(errors[-3:])}
     return None
 
 
 def run_turn(user_input: str, messages: list):
-    """Generator. Yields events for one user turn. Mutates `messages` in place.
-
-    Events:
-      {"type": "token",       "text": "..."}
-      {"type": "tool_call",   "id": "...", "name": "...", "args": {...}}
-      {"type": "tool_result", "id": "...", "preview": "..."}
-      {"type": "usage",       "input": N, "output": N, "total": N}
-      {"type": "error",       "message": "..."}
-      {"type": "max_steps"}
-      {"type": "done",        "answered": True/False}
-    """
     try:
         workspace = get_workspace()
     except Exception:
         workspace = "Not set"
 
-    system_prompt = build_system_prompt(workspace, get_memory_context(user_input))
+    mode = "general"
+    if config.SMART_SUBAGENTS:
+        mode = detect_mode(user_input)
+        yield {"type": "mode", "mode": mode}
 
+    system_prompt = build_system_prompt(workspace, get_memory_context(user_input), mode=mode)
     if messages and isinstance(messages[0], SystemMessage):
         messages[0] = SystemMessage(content=system_prompt)
     else:
         messages.insert(0, SystemMessage(content=system_prompt))
 
+    # ── FORCED TOOL INJECTION ────────────────────────────────
+    forced_tool, reminder = detect_forced_tool(user_input)
+    if forced_tool:
+        messages.append(SystemMessage(
+            content=f"⚠️ ACTION REQUIRED: {reminder}\n"
+                    f"Call `{forced_tool}` NOW before generating any final answer."
+        ))
+        yield {"type": "status", "text": f"🎯 forcing tool: {forced_tool}"}
+
     messages.append(HumanMessage(content=user_input))
 
-    total_input = 0
-    total_output = 0
+    # Planning
+    if config.SMART_PLANNING and needs_planning(user_input) and not forced_tool:
+        yield {"type": "status", "text": "🧠 Planning..."}
+        plan_text = _quick_call(PLANNING_SYSTEM, user_input)
+        steps = _extract_plan(plan_text or "")
+        if steps:
+            yield {"type": "plan", "steps": steps}
+            messages.append(SystemMessage(
+                content="Plan:\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+            ))
+
+    total_in = 0
+    total_out = 0
+    final_text = ""
+    hit_max = True
+    any_tool_used = False
 
     for step in range(config.MAX_STEPS):
         aggregated = None
@@ -540,11 +643,11 @@ def run_turn(user_input: str, messages: list):
             gen = _stream_with_fallback(messages)
             while True:
                 try:
-                    event = next(gen)
-                    if event.get("type") == "usage":
-                        total_input += event.get("input", 0)
-                        total_output += event.get("output", 0)
-                    yield event
+                    ev = next(gen)
+                    if ev.get("type") == "usage":
+                        total_in += ev.get("input", 0)
+                        total_out += ev.get("output", 0)
+                    yield ev
                 except StopIteration as si:
                     aggregated = si.value
                     break
@@ -554,44 +657,53 @@ def run_turn(user_input: str, messages: list):
 
         if aggregated is None:
             return
-
         messages.append(aggregated)
 
         if not aggregated.tool_calls:
-            if total_input or total_output:
-                yield {
-                    "type": "usage_total",
-                    "input": total_input,
-                    "output": total_output,
-                    "total": total_input + total_output,
-                }
-            yield {"type": "done", "answered": True}
-            return
+            final_text = aggregated.content if isinstance(aggregated.content, str) else ""
+            hit_max = False
+            break
 
         for tc in aggregated.tool_calls:
-            yield {
-                "type": "tool_call",
-                "id": tc["id"],
-                "name": tc["name"],
-                "args": tc["args"],
-            }
+            any_tool_used = True
+            yield {"type": "tool_call", "id": tc["id"],
+                   "name": tc["name"], "args": tc["args"]}
             result = run_tool(tc)
             yield {"type": "tool_result", "id": tc["id"], "preview": str(result)[:300]}
             messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
-    yield {"type": "max_steps"}
-    yield {"type": "done", "answered": False}
+    if hit_max:
+        yield {"type": "max_steps"}
 
+    # Reflection — only on pure-chat turns (no tool ran)
+    if (config.SMART_REFLECTION
+            and final_text
+            and not any_tool_used
+            and len(final_text) >= config.REFLECTION_MIN_CHARS
+            and "❌" not in final_text):
+        yield {"type": "status", "text": "🔍 Reflecting..."}
+        critique = _quick_call(
+            REFLECTION_SYSTEM,
+            f"Q: {user_input}\n\nA: {final_text}",
+        )
+        if critique:
+            c = critique.strip()
+            if c.upper() not in ("OK", "OK.", "OKAY") and len(c) > 10:
+                first_line = c.split("\n")[0].strip()
+                yield {"type": "reflection", "text": first_line}
 
-# ═══════════════════════════════════════════════════════════
-#  5. CLI LOOP
-# ═══════════════════════════════════════════════════════════
+    if total_in or total_out:
+        yield {"type": "usage_total", "input": total_in,
+               "output": total_out, "total": total_in + total_out}
+
+    yield {"type": "done", "answered": not hit_max}
+
 
 def main() -> None:
     messages: list = []
-    print("\n🤖 SUPER AGENT ready!  (type 'exit' to quit)\n")
+    print("\n🤖 SUPER AGENT (Smart) ready!  (type 'exit' to quit)\n")
     if not _memory_ok:
-        print("⚠️  Memory disabled — check the log above.\n")
+        print("⚠️  Memory disabled.\n")
 
     while True:
         try:
@@ -599,7 +711,6 @@ def main() -> None:
         except (KeyboardInterrupt, EOFError):
             print("\n👋 Goodbye!")
             break
-
         if user_input.lower() in ("exit", "quit", "bye"):
             print("👋 Goodbye!")
             break
@@ -607,18 +718,27 @@ def main() -> None:
             continue
 
         print("🤖 AI: ", end="", flush=True)
-
         turn_usage = None
-
         try:
             for event in run_turn(user_input, messages):
                 t = event["type"]
                 if t == "token":
                     print(event["text"], end="", flush=True)
+                elif t == "mode":
+                    if event["mode"] != "general":
+                        print(f"\n🎯 mode: {event['mode']}", flush=True)
+                elif t == "status":
+                    print(f"\n{event['text']}", flush=True)
+                elif t == "plan":
+                    print("📋 Plan:", flush=True)
+                    for i, s in enumerate(event["steps"], 1):
+                        print(f"   {i}. {s}", flush=True)
                 elif t == "tool_call":
                     print(f"\n🛠️  {event['name']}({list(event['args'].keys())})", flush=True)
                 elif t == "tool_result":
                     print(f"   ↳ {event['preview']}", flush=True)
+                elif t == "reflection":
+                    print(f"\n💭 {event['text']}", flush=True)
                 elif t == "error":
                     print(f"\n❌ {event['message']}", flush=True)
                 elif t == "max_steps":
@@ -628,17 +748,12 @@ def main() -> None:
         except KeyboardInterrupt:
             print("\n⏹️  Interrupted.", flush=True)
         except Exception as e:
-            print(f"\n❌ Unexpected error: {type(e).__name__}: {e}", flush=True)
+            print(f"\n❌ {type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
 
         if turn_usage:
-            print(
-                f"\n   [tokens: {turn_usage['input']} in / "
-                f"{turn_usage['output']} out / "
-                f"{turn_usage['total']} total]",
-                flush=True,
-            )
-
+            print(f"\n   [tokens: {turn_usage['input']} in / "
+                  f"{turn_usage['output']} out / {turn_usage['total']} total]", flush=True)
         print("\n")
 
 
