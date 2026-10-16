@@ -1,7 +1,7 @@
 """rag.py — local document indexing and retrieval.
 
 Drop PDFs, .txt, .md, or code files into ./documents/
-Then call index_documents() once. Ask questions after.
+Or upload them through the web UI (see /upload in web_server.py).
 """
 
 import os
@@ -26,6 +26,33 @@ def _get_store():
     return _rag_store
 
 
+def _hash(text):
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _read_file(path):
+    """Return the text content of a file, or None if unreadable."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in config.RAG_ALLOWED_EXTS:
+        return None
+    try:
+        if ext == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(path)
+                return "\n".join(
+                    (p.extract_text() or "") for p in reader.pages
+                )
+            except ImportError:
+                print("   ⚠️ pypdf not installed — skipping PDF")
+                return None
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        print(f"   ⚠️ Skipping {path}: {e}")
+        return None
+
+
 def _iter_files(folder):
     """Yield (path, text_content) for readable files in folder."""
     if not os.path.isdir(folder):
@@ -34,29 +61,9 @@ def _iter_files(folder):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for name in files:
             path = os.path.join(root, name)
-            ext = os.path.splitext(name)[1].lower()
-            try:
-                if ext == ".pdf":
-                    # Optional: needs pypdf. Skip if not installed.
-                    try:
-                        from pypdf import PdfReader
-                        reader = PdfReader(path)
-                        text = "\n".join(
-                            (p.extract_text() or "") for p in reader.pages
-                        )
-                    except ImportError:
-                        continue
-                elif ext in (".txt", ".md", ".py", ".js", ".json",
-                             ".html", ".css", ".csv", ".log"):
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        text = f.read()
-                else:
-                    continue
-
-                if text.strip():
-                    yield path, text
-            except Exception as e:
-                print(f"   ⚠️ Skipping {path}: {e}")
+            text = _read_file(path)
+            if text and text.strip():
+                yield path, text
 
 
 def _chunk(text, size=None, overlap=None):
@@ -73,9 +80,7 @@ def _chunk(text, size=None, overlap=None):
     return chunks
 
 
-def _hash(text):
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
-
+# ── Bulk index (used by the `index_my_documents` tool) ──────
 
 def index_documents(force: bool = False) -> str:
     """Index every file in ./documents/. Skips files already indexed."""
@@ -88,7 +93,6 @@ def index_documents(force: bool = False) -> str:
 
     store = _get_store()
 
-    # Existing IDs
     existing_ids = set()
     try:
         existing = store.get()
@@ -104,15 +108,12 @@ def index_documents(force: bool = False) -> str:
         chunks = _chunk(text)
         if not chunks:
             continue
-        # Deduplicate per-file via a prefix id
         file_id = _hash(path + text[:100])
-        # If every chunk already indexed, skip file
         file_chunk_ids = [f"{file_id}:{i}" for i in range(len(chunks))]
         if not force and all(cid in existing_ids for cid in file_chunk_ids):
             skipped += 1
             continue
 
-        # Index new chunks
         texts = []
         metadatas = []
         ids = []
@@ -121,7 +122,11 @@ def index_documents(force: bool = False) -> str:
             if cid in existing_ids and not force:
                 continue
             texts.append(c)
-            metadatas.append({"source": path, "chunk": i})
+            metadatas.append({
+                "source": path,
+                "name": os.path.basename(path),
+                "chunk": i,
+            })
             ids.append(cid)
 
         if texts:
@@ -140,20 +145,171 @@ def index_documents(force: bool = False) -> str:
     )
 
 
+# ── Single-file ops for the upload UI ───────────────────────
+
+def index_single_file(path: str, force: bool = True) -> str:
+    """Index or re-index one file. Returns a status message."""
+    if not os.path.isfile(path):
+        return f"⚠️ Not a file: {path}"
+
+    name = os.path.basename(path)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in config.RAG_ALLOWED_EXTS:
+        return f"⚠️ Unsupported extension: {ext}"
+
+    text = _read_file(path)
+    if not text or not text.strip():
+        return f"⚠️ No readable text in {name}"
+
+    store = _get_store()
+
+    existing_ids = []
+    try:
+        existing = store.get(where={"name": name})
+        existing_ids = existing.get("ids", []) or []
+    except Exception:
+        existing_ids = []
+
+    if existing_ids and not force:
+        return f"⏭️ Already indexed: {name} ({len(existing_ids)} chunks)"
+
+    if existing_ids and force:
+        try:
+            store.delete(ids=existing_ids)
+        except Exception:
+            pass
+
+    chunks = _chunk(text)
+    if not chunks:
+        return f"⚠️ Nothing to chunk in {name}"
+
+    file_id = _hash(path + text[:100])
+    texts, metadatas, ids = [], [], []
+    for i, c in enumerate(chunks):
+        texts.append(c)
+        metadatas.append({"source": path, "name": name, "chunk": i})
+        ids.append(f"{file_id}:{i}")
+
+    try:
+        store.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+    except Exception as e:
+        return f"❌ Indexing failed: {e}"
+
+    return f"✅ Indexed {name}: {len(chunks)} chunks"
+
+
+def list_documents() -> list:
+    """Return every indexable file in RAG_DIR with its index status."""
+    folder = config.RAG_DIR
+    if not os.path.isdir(folder):
+        return []
+
+    store = _get_store()
+    out = []
+    for name in sorted(os.listdir(folder)):
+        full = os.path.join(folder, name)
+        if not os.path.isfile(full):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in config.RAG_ALLOWED_EXTS:
+            continue
+        try:
+            size = os.path.getsize(full)
+        except Exception:
+            size = 0
+        chunks = 0
+        try:
+            data = store.get(where={"name": name})
+            chunks = len(data.get("ids", []) or [])
+        except Exception:
+            chunks = 0
+        out.append({
+            "name": name,
+            "size": size,
+            "ext": ext,
+            "chunks": chunks,
+            "indexed": chunks > 0,
+        })
+    return out
+
+
+def delete_document(name: str) -> str:
+    """Remove a document from disk and drop all its chunks from Chroma."""
+    folder = os.path.abspath(config.RAG_DIR)
+    full = os.path.abspath(os.path.join(folder, name))
+
+    # Safety: must stay inside RAG_DIR.
+    if not full.startswith(folder + os.sep) and full != folder:
+        return "❌ Invalid path"
+
+    store = _get_store()
+    removed_chunks = 0
+    try:
+        existing = store.get(where={"name": name})
+        ids = existing.get("ids", []) or []
+        if ids:
+            store.delete(ids=ids)
+            removed_chunks = len(ids)
+    except Exception:
+        pass
+
+    removed_file = False
+    if os.path.isfile(full):
+        try:
+            os.remove(full)
+            removed_file = True
+        except Exception as e:
+            return f"❌ Could not delete file: {e}"
+
+    if removed_file or removed_chunks:
+        return f"🗑️ Deleted {name} ({removed_chunks} chunks)"
+    return f"⚠️ Nothing to delete: {name}"
+
+
+def get_index_stats() -> dict:
+    """Quick stats for the UI header."""
+    store = _get_store()
+    total = 0
+    files = 0
+    try:
+        data = store.get()
+        total = len(data.get("ids", []) or [])
+        names = {
+            (m or {}).get("name")
+            for m in (data.get("metadatas", []) or [])
+        }
+        files = len([n for n in names if n])
+    except Exception:
+        pass
+    return {"total_chunks": total, "total_files": files}
+
+
 def search_documents(query: str, k: int = None) -> str:
-    """Semantic search over indexed documents."""
+    """Semantic search over indexed documents. Skips weak matches."""
     k = k or config.RAG_TOP_K
     try:
         store = _get_store()
-        results = store.similarity_search(query, k=k)
+        pairs = store.similarity_search_with_score(query, k=k)
     except Exception as e:
         return f"❌ Document search failed: {e}"
 
-    if not results:
+    if not pairs:
         return "No matching content in your documents. Did you index them first?"
 
+    # Drop weak matches. Chroma L2 distance: lower = closer.
+    kept = [(doc, score) for doc, score in pairs
+            if score <= config.RAG_MAX_DISTANCE]
+
+    if not kept:
+        return (
+            f"⚠️ No strong match in your documents for: {query!r}\n"
+            f"   (best distance was {pairs[0][1]:.2f}, threshold is "
+            f"{config.RAG_MAX_DISTANCE}). Try a different query, or make sure "
+            f"the right files are indexed."
+        )
+
     out = []
-    for r in results:
-        src = r.metadata.get("source", "unknown")
-        out.append(f"📄 {src}\n{r.page_content[:500]}")
+    for doc, score in kept:
+        src = doc.metadata.get("source", "unknown")
+        out.append(f"📄 {src}\n{doc.page_content[:500]}")
     return "Found in your documents:\n\n" + "\n\n---\n\n".join(out)

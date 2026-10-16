@@ -8,8 +8,8 @@ text.txt
 credentials.json
 
 # ═══ VIRTUAL ENVIRONMENTS ═══
-venv/
 .venv/
+venv/
 env/
 ENV/
 
@@ -27,21 +27,23 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
-# ═══ PROJECT DATA — generated at runtime ═══
+# ═══ RUNTIME DATA ═══
 chroma_db/
 skills_db/
+skills.json
 ai_creations/
+documents/
+cache/
+jobs/
 workspace.json
+projects.json
 video_frames/
 downloaded_*
+watched_*
+audio_chunk_*
 *.mp3
 *.mp4
 *.wav
-skills.json
-
-# ═══ HUGGINGFACE CACHE ═══
-.cache/
-huggingface/
 
 # ═══ IDE / OS ═══
 .vscode/
@@ -56,6 +58,6 @@ desktop.ini
 *.log
 logs/
 
-# ═══ TEST OUTPUT ═══
+# ═══ TESTING ═══
 .coverage
 htmlcov/
